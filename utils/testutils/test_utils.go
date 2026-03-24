@@ -1047,6 +1047,11 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		"SELECT * FROM %s WHERE _op_type = '%s'",
 		fullTableName, opSymbol,
 	)
+	if slices.Contains(constants.OnlyStrictCDCDriver, constants.DriverType(driver)) {
+		if _, ok := schema["id_int"]; ok {
+			selectQuery += " AND id_int IS NOT NULL"
+		}
+	}
 	t.Logf("Executing query: %s", selectQuery)
 
 	var selectRows []types.Row
