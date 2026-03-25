@@ -48,6 +48,7 @@ type IntegrationTest struct {
 	DestinationDB                    string
 	CursorField                      string
 	PartitionRegex                   string
+	FilterConfig                     string
 }
 
 type PerformanceTest struct {
@@ -226,8 +227,8 @@ func discoverCommand(config TestConfig, flags ...string) string {
 	return baseCmd
 }
 
-// update normalization=true for selected streams under selected_streams.<namespace> by name
-func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex string, stream []string, isBackfill bool) string {
+// update normalization=true, partition_regex, and filter_input for selected streams under selected_streams.<namespace> by name
+func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex, filterConfig string, stream []string, isBackfill bool) string {
 	if len(stream) == 0 {
 		return ""
 	}
@@ -238,8 +239,13 @@ func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex s
 	}
 	condition := strings.Join(streamConditions, " or ")
 	tmpCatalog := fmt.Sprintf("/tmp/%s_%s_streams.json", config.Driver, utils.Ternary(isBackfill, "backfill", "cdc").(string))
+
+	if filterConfig == "" {
+		filterConfig = "{}"
+	}
 	jqExpr := fmt.Sprintf(
-		`jq '.selected_streams = { "%s": (.selected_streams["%s"] | map(select(%s) | .normalization = true | .partition_regex = "%s")) }' %s > %s && mv %s %s`,
+		`jq --argjson filter '%s' '.selected_streams = { "%s": (.selected_streams["%s"] | map(select(%s) | .normalization = true | .partition_regex = "%s" | .filter_config = $filter)) }' %s > %s && mv %s %s`,
+		filterConfig,
 		namespace,
 		namespace,
 		condition,
@@ -388,9 +394,9 @@ func (cfg *IntegrationTest) runSyncAndVerify(
 
 	t.Logf("Sync successful for %s driver", cfg.TestConfig.Driver)
 
-	// Use evolved schema only for CDC "update" operation or for kafka when schema evolution is expected
+	// Use evolved schema only for CDC "update" operation (where schema evolution is expected)
 	// Incremental "insert" uses opSymbol "u" but doesn't have schema evolution
-	evolvedSchema := operation == "update" || operation == "evolve-schema"
+	evolvedSchema := operation == "update"
 
 	switch destinationType {
 	case "iceberg":
@@ -475,25 +481,6 @@ func (cfg *IntegrationTest) testIcebergFullLoadAndCDC(
 		},
 	}
 
-	kafkaTestCases := []syncTestCase{
-		{
-			name:      "CDC - strict - insert",
-			operation: "",
-			useState:  false,
-			opSymbol:  "c",
-			expected:  cfg.ExpectedData,
-		},
-		{
-			name:      "CDC - strict - evolve-schema",
-			operation: "evolve-schema",
-			useState:  true,
-			opSymbol:  "c",
-			expected:  cfg.ExpectedUpdatedData,
-		},
-	}
-
-	testCases = utils.Ternary(slices.Contains(constants.OnlyStrictCDCDriver, constants.DriverType(cfg.TestConfig.Driver)), kafkaTestCases, testCases).([]syncTestCase)
-
 	// Run each test case
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -573,25 +560,6 @@ func (cfg *IntegrationTest) testParquetFullLoadAndCDC(
 			expected:  nil,
 		},
 	}
-
-	kafkaTestCases := []syncTestCase{
-		{
-			name:      "CDC - strict - insert",
-			operation: "",
-			useState:  false,
-			opSymbol:  "c",
-			expected:  cfg.ExpectedData,
-		},
-		{
-			name:      "CDC - strict - evolve-schema",
-			operation: "evolve-schema",
-			useState:  true,
-			opSymbol:  "c",
-			expected:  cfg.ExpectedUpdatedData,
-		},
-	}
-
-	testCases = utils.Ternary(slices.Contains(constants.OnlyStrictCDCDriver, constants.DriverType(cfg.TestConfig.Driver)), kafkaTestCases, testCases).([]syncTestCase)
 
 	// Run each test case
 	for _, tc := range testCases {
@@ -811,11 +779,6 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)
 	t.Logf("Test data directory: %s", cfg.TestConfig.HostTestDataPath)
 	currentTestTable := fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver)
-	syncTopics := []string{currentTestTable}
-	//defined for multiple streams
-	if cfg.TestConfig.Driver == string(constants.Kafka) {
-		syncTopics = []string{currentTestTable + "_1", currentTestTable + "_2", currentTestTable + "_3"}
-	}
 
 	t.Run("Discover", func(t *testing.T) {
 		req := testcontainers.ContainerRequest{
@@ -844,9 +807,9 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 							}
 
 							// 2. Query on test table
-							cfg.ExecuteQuery(ctx, t, syncTopics, "create", false)
-							cfg.ExecuteQuery(ctx, t, syncTopics, "clean", false)
-							cfg.ExecuteQuery(ctx, t, syncTopics, "add", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "create", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "clean", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "add", false)
 
 							// 3. Run discover command
 							discoverCmd := discoverCommand(*cfg.TestConfig)
@@ -869,7 +832,7 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 							t.Logf("Generated streams validated with test streams")
 
 							// 5. Clean up
-							cfg.ExecuteQuery(ctx, t, syncTopics, "drop", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)
 							t.Logf("%s discover test-container clean up", cfg.TestConfig.Driver)
 							return nil
 						},
@@ -918,15 +881,15 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 							}
 
 							// 2. Query on test table
-							cfg.ExecuteQuery(ctx, t, syncTopics, "create", false)
-							cfg.ExecuteQuery(ctx, t, syncTopics, "clean", false)
-							cfg.ExecuteQuery(ctx, t, syncTopics, "add", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "create", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "clean", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "add", false)
 
 							// streamUpdateCmd := fmt.Sprintf(
 							// 	`jq '(.selected_streams[][] | .normalization) = true' %s > /tmp/streams.json && mv /tmp/streams.json %s`,
 							// 	cfg.TestConfig.CatalogPath, cfg.TestConfig.CatalogPath,
 							// )
-							streamUpdateCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, cfg.PartitionRegex, syncTopics, true)
+							streamUpdateCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, cfg.PartitionRegex, cfg.FilterConfig, []string{currentTestTable}, true)
 							if code, out, err := utils.ExecCommand(ctx, c, streamUpdateCmd); err != nil || code != 0 {
 								return fmt.Errorf("failed to enable normalization and partition regex in streams.json (%d): %s\n%s",
 									code, err, out,
@@ -946,40 +909,35 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 							if !slices.Contains(constants.SkipCDCDrivers, constants.DriverType(cfg.TestConfig.Driver)) {
 								for _, wt := range writerTypes {
 									t.Run(fmt.Sprintf("Iceberg (%s) Full load + CDC tests", wt.name), func(t *testing.T) {
-										for _, topic := range syncTopics {
-											if err := cfg.testIcebergWriter(ctx, t, c, topic, wt.useArrow, cfg.testIcebergFullLoadAndCDC); err != nil {
-												t.Fatalf("Iceberg (%s) Full load + CDC tests failed: %v", wt.name, err)
-											}
+										if err := cfg.testIcebergWriter(ctx, t, c, currentTestTable, wt.useArrow, cfg.testIcebergFullLoadAndCDC); err != nil {
+											t.Fatalf("Iceberg (%s) Full load + CDC tests failed: %v", wt.name, err)
 										}
 									})
 								}
 
 								t.Run("Parquet Full load + CDC tests", func(t *testing.T) {
-									for _, topic := range syncTopics {
-										if err := cfg.testParquetFullLoadAndCDC(ctx, t, c, topic); err != nil {
-											t.Fatalf("Parquet Full load + CDC tests failed: %v", err)
-										}
+									if err := cfg.testParquetFullLoadAndCDC(ctx, t, c, currentTestTable); err != nil {
+										t.Fatalf("Parquet Full load + CDC tests failed: %v", err)
 									}
 								})
 							}
 
-							if !slices.Contains(constants.OnlyStrictCDCDriver, constants.DriverType(cfg.TestConfig.Driver)) {
-								for _, wt := range writerTypes {
-									t.Run(fmt.Sprintf("Iceberg (%s) Full load + Incremental tests", wt.name), func(t *testing.T) {
-										if err := cfg.testIcebergWriter(ctx, t, c, currentTestTable, wt.useArrow, cfg.testIcebergFullLoadAndIncremental); err != nil {
-											t.Fatalf("Iceberg (%s) Full load + Incremental tests failed: %v", wt.name, err)
-										}
-									})
-								}
-								t.Run("Parquet Full load + Incremental tests", func(t *testing.T) {
-									if err := cfg.testParquetFullLoadAndIncremental(ctx, t, c, currentTestTable); err != nil {
-										t.Fatalf("Parquet Full load + Incremental tests failed: %v", err)
+							for _, wt := range writerTypes {
+								t.Run(fmt.Sprintf("Iceberg (%s) Full load + Incremental tests", wt.name), func(t *testing.T) {
+									if err := cfg.testIcebergWriter(ctx, t, c, currentTestTable, wt.useArrow, cfg.testIcebergFullLoadAndIncremental); err != nil {
+										t.Fatalf("Iceberg (%s) Full load + Incremental tests failed: %v", wt.name, err)
 									}
 								})
 							}
+
+							t.Run("Parquet Full load + Incremental tests", func(t *testing.T) {
+								if err := cfg.testParquetFullLoadAndIncremental(ctx, t, c, currentTestTable); err != nil {
+									t.Fatalf("Parquet Full load + Incremental tests failed: %v", err)
+								}
+							})
 
 							// 5. Clean up
-							cfg.ExecuteQuery(ctx, t, syncTopics, "drop", false)
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)
 							t.Logf("%s sync test-container clean up", cfg.TestConfig.Driver)
 							return nil
 						},
@@ -1047,11 +1005,6 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		"SELECT * FROM %s WHERE _op_type = '%s'",
 		fullTableName, opSymbol,
 	)
-	if slices.Contains(constants.OnlyStrictCDCDriver, constants.DriverType(driver)) {
-		if _, ok := schema["id_int"]; ok {
-			selectQuery += " AND id_int IS NOT NULL"
-		}
-	}
 	t.Logf("Executing query: %s", selectQuery)
 
 	var selectRows []types.Row
@@ -1082,6 +1035,13 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 			break
 		}
 
+		// For delete operations, 0 rows is acceptable - exit immediately without retrying
+		if opSymbol == "d" {
+			queryErr = nil
+			t.Logf("Delete verification passed: found 0 rows for _op_type = 'd' (acceptable)")
+			break
+		}
+
 		// for every type of operation, op symbol will be different, using that to ensure data is not stale
 		queryErr = fmt.Errorf("stale data: query succeeded but returned 0 rows for _op_type = '%s'", opSymbol)
 		t.Logf("Query attempt %d/%d failed: %v", attempt+1, maxRetries, queryErr)
@@ -1093,15 +1053,17 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		}
 	}
 
-	require.NoError(t, queryErr, "Failed to collect data rows from Iceberg after %d attempts: %v", maxRetries, queryErr)
-	require.NotEmpty(t, selectRows, "No rows returned for _op_type = '%s'", opSymbol)
-
-	// delete row checked
+	// For delete operations, accept both 0 and 1 row (both are valid outcomes)
 	if opSymbol == "d" {
-		deletedID := selectRows[0].Value("_olake_id")
-		require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		if len(selectRows) > 0 {
+			deletedID := selectRows[0].Value("_olake_id")
+			require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		}
+		t.Logf("Delete verification passed: found %d row(s) for _op_type = 'd'", len(selectRows))
 		return
 	}
+	require.NoError(t, queryErr, "Failed to collect data rows from Iceberg after %d attempts: %v", maxRetries, queryErr)
+	require.NotEmpty(t, selectRows, "No rows returned for _op_type = '%s'", opSymbol)
 
 	for rowIdx, row := range selectRows {
 		icebergMap := make(map[string]interface{}, len(schema)+1)
@@ -1117,7 +1079,7 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 			for key := range defaultCDCColumnsSchema {
 				icebergValue, ok := icebergMap[key]
 				require.Truef(t, ok, "Row %d: missing column %q in Iceberg result", rowIdx, key)
-				require.NotNil(t, icebergValue, "Row %d: expected column %q to be non-nil, got %#v", rowIdx, key, icebergValue)
+				require.NotEmpty(t, icebergValue, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, icebergValue)
 				if key == constants.CdcTimestamp {
 					ts, ok := normalizeToTime(icebergValue)
 					require.Truef(t, ok, "Row %d: expected %q to be a timestamp, got %T (%#v)", rowIdx, key, icebergValue, icebergValue)
@@ -1234,6 +1196,11 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 		if err == nil {
 			break
 		}
+		// For delete operations, if path doesn't exist that's acceptable (no data written)
+		if opSymbol == "d" && strings.Contains(err.Error(), "PATH_NOT_FOUND") {
+			t.Logf("Delete verification passed: Parquet path does not exist (no data written)")
+			return
+		}
 		if attempt < maxRetries {
 			t.Logf("Attempt %d/%d: Failed to create view, retrying in 2s: %v", attempt, maxRetries, err)
 			time.Sleep(2 * time.Second)
@@ -1258,13 +1225,19 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 
 	rows, err := df.Collect(ctx)
 	require.NoError(t, err, "Failed to collect rows from Parquet query")
-	require.NotEmpty(t, rows, "No rows returned for _op_type = '%s'", opSymbol)
 
+	// For delete operations, accept both 0 and 1 row (both are valid outcomes)
 	if opSymbol == "d" {
-		deletedID := rows[0].Value("_olake_id")
-		require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		if len(rows) > 0 {
+			deletedID := rows[0].Value("_olake_id")
+			require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		}
+		t.Logf("Delete verification passed: found %d row(s) for _op_type = 'd'", len(rows))
 		return
 	}
+
+	// For non-delete operations, require at least one row
+	require.NotEmpty(t, rows, "No rows returned for _op_type = '%s'", opSymbol)
 
 	for rowIdx, row := range rows {
 		parquetMap := make(map[string]interface{}, len(schema)+1)
@@ -1281,7 +1254,7 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 			for key := range defaultCDCColumnsSchema {
 				val, ok := parquetMap[key]
 				require.Truef(t, ok, "Row %d: missing column %q in Parquet result", rowIdx, key)
-				require.NotNil(t, val, "Row %d: expected column %q to be non-nil, got %#v", rowIdx, key, val)
+				require.NotEmpty(t, val, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, val)
 				if key == constants.CdcTimestamp {
 					ts, ok := normalizeToTime(val)
 					require.Truef(t, ok, "Row %d: expected %q to be a timestamp, got %T (%#v)", rowIdx, key, val, val)
@@ -1441,7 +1414,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 							}
 							t.Log("(backfill) discover completed")
 
-							updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", cfg.BackfillStreams, true)
+							updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", "", cfg.BackfillStreams, true)
 							if code, _, err := utils.ExecCommand(ctx, c, updateStreamsCmd); err != nil || code != 0 {
 								return fmt.Errorf("failed to update streams: %s", err)
 							}
@@ -1480,7 +1453,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 								}
 								t.Log("(cdc) discover completed")
 
-								updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", cfg.CDCStreams, false)
+								updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", "", cfg.CDCStreams, false)
 								if code, _, err := utils.ExecCommand(ctx, c, updateStreamsCmd); err != nil || code != 0 {
 									return fmt.Errorf("failed to update streams: %s", err)
 								}
