@@ -134,43 +134,61 @@ func PostgresBlockSizeQuery() string {
 	return `SHOW block_size`
 }
 
-// PostgresPartitionPages returns total relpages for each partition and the parent table.
-// This can be used to dynamically adjust chunk sizes based on partition distribution.
-func PostgresPartitionPages(stream types.StreamInterface) string {
+// PostgresServerVersionNum returns the server version as an integer (e.g. PG 14.5 → 140005).
+func PostgresServerVersionNum() string {
+	return `SELECT current_setting('server_version_num')::int`
+}
+
+// PostgresPartitionPagesPG12 returns leaf-partition page counts using pg_partition_tree (PG 12+).
+// Intermediate partitions are excluded via isleaf=true; works for any partition depth.
+func PostgresPartitionPagesPG12(stream types.StreamInterface) string {
 	return fmt.Sprintf(`
-        WITH parent AS (
-            SELECT c.oid AS parent_oid
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = '%s'
-                AND c.relname = '%s'
-        ),
-        partitions AS (
-            SELECT
-                child.relname AS name,
-                CEIL(1.05 * (pg_relation_size(child.oid) / current_setting('block_size')::int)) AS pages
-            FROM pg_inherits i
-            JOIN pg_class child ON child.oid = i.inhrelid
-            JOIN parent p ON p.parent_oid = i.inhparent
-            
-            UNION ALL
-            
-            SELECT
-                c.relname AS name,
-                CEIL(1.05 * (pg_relation_size(c.oid) / current_setting('block_size')::int)) AS pages
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = '%s'
-                AND c.relname = '%s'
-        )
-        SELECT 
-            name, 
-            pages 
-        FROM partitions 
+        SELECT
+            pt.relid::text AS name,
+            CEIL(1.05 * (pg_relation_size(pt.relid::oid) / current_setting('block_size')::int))::bigint AS pages
+        FROM pg_partition_tree('%s.%s') pt
+        WHERE pt.isleaf = true
         ORDER BY pages DESC;
     `,
 		stream.Namespace(),
 		stream.Name(),
+	)
+}
+
+// TODO:check this query might be more optimized for performance
+// PostgresPartitionPages returns leaf-partition page counts using a recursive CTE over
+// pg_inherits. Works on all Postgres versions (10+); used as fallback for PG < 12.
+func PostgresPartitionPages(stream types.StreamInterface) string {
+	return fmt.Sprintf(`
+        WITH RECURSIVE partition_tree AS (
+            SELECT
+                c.oid,
+                c.relname AS name,
+                CEIL(1.05 * (pg_relation_size(c.oid) / current_setting('block_size')::int))::bigint AS pages
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = '%s'
+                AND c.relname = '%s'
+
+            UNION ALL
+
+            SELECT
+                child.oid,
+                child.relname AS name,
+                CEIL(1.05 * (pg_relation_size(child.oid) / current_setting('block_size')::int))::bigint AS pages
+            FROM pg_inherits i
+            JOIN pg_class child ON child.oid = i.inhrelid
+            JOIN partition_tree pt ON pt.oid = i.inhparent
+        )
+        SELECT
+            name,
+            pages
+        FROM partition_tree
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pg_inherits WHERE inhparent = partition_tree.oid
+        )
+        ORDER BY pages DESC;
+    `,
 		stream.Namespace(),
 		stream.Name(),
 	)
@@ -228,94 +246,6 @@ func PostgresChunkScanQuery(stream types.StreamInterface, filterColumn string, c
 
 	chunkCond = utils.Ternary(filter != "" && chunkCond != "", fmt.Sprintf("(%s) AND (%s)", chunkCond, filter), chunkCond).(string)
 	return fmt.Sprintf(`SELECT * FROM %s WHERE %s`, quotedTable, chunkCond)
-}
-
-// TODO: Common out buildChunkConditionMySQL for MSSQL, DB2, and other drivers where needed.
-// MySQL-Specific Queries buildChunkConditionMySQL builds the condition for a chunk in MySQL
-func buildChunkConditionMySQL(filterColumns []string, chunk types.Chunk, extraFilter string) (string, []any) {
-	quotedCols := QuoteColumns(filterColumns, constants.MySQL)
-
-	splitBoundaryValues := func(boundary any) []string {
-		if boundary == nil {
-			return nil
-		}
-		str := utils.ConvertToString(boundary)
-		parts := strings.Split(str, ",")
-		for i, part := range parts {
-			parts[i] = strings.TrimSpace(part)
-		}
-		return parts
-	}
-
-	// buildBound creates the expanded logic for:
-	//   (c1, c2, c3) >= (v1, v2, v3)
-	// as:
-	//   (c1 > v1) OR (c1 = v1 AND c2 > v2) OR (c1 = v1 AND c2 = v2 AND c3 >= v3)
-	//
-	// For upper bounds, it creates:
-	//   (c1 < v1) OR (c1 = v1 AND c2 < v2) OR (c1 = v1 AND c2 = v2 AND c3 < v3)
-	buildBound := func(values []string, isLower bool) (string, []any) {
-		var args []any
-		orGroups := make([]string, 0, len(quotedCols))
-
-		for colIdx := 0; colIdx < len(quotedCols); colIdx++ {
-			andConds := make([]string, 0, colIdx+1)
-
-			// Prefix columns must match exactly: c1 = v1 AND c2 = v2 ...
-			for prefixIdx := 0; prefixIdx < colIdx; prefixIdx++ {
-				if prefixIdx < len(values) {
-					andConds = append(andConds, fmt.Sprintf("%s = ?", quotedCols[prefixIdx]))
-					args = append(args, values[prefixIdx])
-				}
-			}
-
-			var op string
-			if isLower {
-				op = ">"
-				if colIdx == len(quotedCols)-1 {
-					op = ">="
-				}
-			} else {
-				op = "<"
-			}
-
-			if colIdx < len(values) {
-				andConds = append(andConds, fmt.Sprintf("%s %s ?", quotedCols[colIdx], op))
-				args = append(args, values[colIdx])
-			}
-			if len(andConds) > 0 {
-				orGroups = append(orGroups, "("+strings.Join(andConds, " AND ")+")")
-			}
-		}
-
-		return "(" + strings.Join(orGroups, " OR ") + ")", args
-	}
-
-	lowerValues := splitBoundaryValues(chunk.Min)
-	upperValues := splitBoundaryValues(chunk.Max)
-
-	chunkCond := ""
-	var args []any
-	switch {
-	case chunk.Min != nil && chunk.Max != nil:
-		lowerCond, lowerArgs := buildBound(lowerValues, true)
-		upperCond, upperArgs := buildBound(upperValues, false)
-		if lowerCond != "" && upperCond != "" {
-			chunkCond = fmt.Sprintf("(%s) AND (%s)", lowerCond, upperCond)
-			args = append(args, lowerArgs...)
-			args = append(args, upperArgs...)
-		}
-	case chunk.Min != nil:
-		chunkCond, args = buildBound(lowerValues, true)
-	case chunk.Max != nil:
-		chunkCond, args = buildBound(upperValues, false)
-	}
-
-	// Combine with any additional filter if present.
-	if extraFilter != "" && chunkCond != "" {
-		chunkCond = fmt.Sprintf("(%s) AND (%s)", chunkCond, extraFilter)
-	}
-	return chunkCond, args
 }
 
 // buildLexicographicChunkCondition builds a WHERE condition for a chunk scan using
@@ -414,6 +344,13 @@ func buildLexicographicChunkCondition(quotedColumns []string, chunk types.Chunk,
 	return chunkCond
 }
 
+// MySQL-Specific Queries
+// buildChunkConditionMySQL builds the condition for a chunk in MySQL.
+func buildChunkConditionMySQL(filterColumns []string, chunk types.Chunk, extraFilter string) string {
+	quotedCols := QuoteColumns(filterColumns, constants.MySQL)
+	return buildLexicographicChunkCondition(quotedCols, chunk, extraFilter)
+}
+
 // MysqlLimitOffsetScanQuery is used to get the rows
 func MysqlLimitOffsetScanQuery(stream types.StreamInterface, chunk types.Chunk, filter string) string {
 	quotedTable := QuoteTable(stream.Namespace(), stream.Name(), constants.MySQL)
@@ -435,10 +372,10 @@ func MysqlLimitOffsetScanQuery(stream types.StreamInterface, chunk types.Chunk, 
 }
 
 // MySQLWithoutState builds a chunk scan query for MySql
-func MysqlChunkScanQuery(stream types.StreamInterface, filterColumns []string, chunk types.Chunk, extraFilter string) (string, []any) {
-	condition, args := buildChunkConditionMySQL(filterColumns, chunk, extraFilter)
+func MysqlChunkScanQuery(stream types.StreamInterface, filterColumns []string, chunk types.Chunk, extraFilter string) string {
+	condition := buildChunkConditionMySQL(filterColumns, chunk, extraFilter)
 	quotedTable := QuoteTable(stream.Namespace(), stream.Name(), constants.MySQL)
-	return fmt.Sprintf("SELECT * FROM %s WHERE %s", quotedTable, condition), args
+	return fmt.Sprintf("SELECT * FROM %s WHERE %s", quotedTable, condition)
 }
 
 // MinMaxQueryMySQL returns the query to fetch MIN and MAX values of a column in a MySQL table
@@ -531,51 +468,27 @@ func MySQLColumnStatsQuery() string {
 	`
 }
 
-// MySQLDistinctValuesWithCollationQuery builds a DISTINCT query over a slice of strings
-// using the column's collation type.
-func MySQLDistinctValuesWithCollationQuery(values []string, columnCollationType string) (string, []any) {
-	unionParts := make([]string, 0, len(values))
-	args := make([]any, 0, len(values))
-	for _, v := range values {
-		unionParts = append(unionParts, "SELECT ? AS val")
-		args = append(args, v)
-	}
-	query := fmt.Sprintf(`
-		SELECT DISTINCT val COLLATE %s AS val
-		FROM (
-			%s
-		) AS t
-		ORDER BY val COLLATE %s;
-	`, columnCollationType, strings.Join(unionParts, " UNION ALL "), columnCollationType)
-	return query, args
-}
+func MySQLDistinctAlignedPKValuesWithCollationQuery(stream types.StreamInterface, pkColumn string, bounds []string, columnCollationType string, minValPadded string, maxValPadded string) (string, []any) {
+	quotedCol := QuoteIdentifier(pkColumn, constants.MySQL)
+	quotedTable := QuoteTable(stream.Namespace(), stream.Name(), constants.MySQL)
 
-// MySQLCountGeneratedInRange builds a query that counts how many values from the provided slice
-// fall within [minVal, maxVal] using the column's collation ordering.
-func MySQLCountGeneratedInRange(values []string, columnCollationType string, minVal, maxVal string) (string, []any) {
-	unionParts := make([]string, 0, len(values))
-	args := make([]any, 0, len(values)+2)
+	firstAtOrAfter := fmt.Sprintf(`(SELECT %s FROM %s WHERE %s >= ? ORDER BY %s ASC LIMIT 1)`, quotedCol, quotedTable, quotedCol, quotedCol)
 
-	args = append(args, minVal, maxVal, maxVal, minVal)
+	unionParts := make([]string, 0, len(bounds))
+	args := make([]any, 0, len(bounds)+2)
 
-	for _, v := range values {
-		unionParts = append(unionParts, "SELECT ? AS val")
+	for _, v := range bounds {
+		unionParts = append(unionParts, fmt.Sprintf("SELECT %s AS actual_pk", firstAtOrAfter))
 		args = append(args, v)
 	}
 
+	args = append(args, minValPadded, maxValPadded)
+
 	query := fmt.Sprintf(`
-		SELECT GREATEST(
-			SUM(CASE 
-				WHEN val COLLATE %s >= ? AND val COLLATE %s <= ? 
-				THEN 1 ELSE 0 END),
-			SUM(CASE 
-				WHEN val COLLATE %s >= ? AND val COLLATE %s <= ? 
-				THEN 1 ELSE 0 END)
-		) AS max_count
-		FROM (
-			%s
-		) AS t;
-	`, columnCollationType, columnCollationType, columnCollationType, columnCollationType, strings.Join(unionParts, " UNION ALL "))
+		SELECT DISTINCT actual_pk COLLATE %s AS val
+		FROM (%s) AS aligned
+			WHERE actual_pk COLLATE %s >= ? AND actual_pk COLLATE %s <= ? ORDER BY val
+	`, columnCollationType, strings.Join(unionParts, " UNION ALL "), columnCollationType, columnCollationType)
 
 	return query, args
 }
@@ -801,11 +714,41 @@ func MSSQLCDCDiscoverQuery(streamIDs []string) string {
 	)
 }
 
+// MSSQLViewDatabaseStatePermissionQuery checks for VIEW DATABASE STATE (all versions) or
+// VIEW DATABASE PERFORMANCE STATE (SQL Server 2022+). Either permission grants access to
+// sys.dm_cdc_log_scan_sessions.
+func MSSQLViewDatabaseStatePermissionQuery() string {
+	return `
+		SELECT CAST(CASE
+			WHEN HAS_PERMS_BY_NAME(NULL, 'DATABASE', 'VIEW DATABASE STATE') = 1 THEN 1
+			WHEN HAS_PERMS_BY_NAME(NULL, 'DATABASE', 'VIEW DATABASE PERFORMANCE STATE') = 1 THEN 1
+			ELSE 0
+		END AS BIT)
+	`
+}
+
+// MSSQLCDCLatestScanSessionQuery returns the latest completed CDC log scan session.
+// Requires VIEW DATABASE STATE permission.
+func MSSQLCDCLatestScanSessionQuery() string {
+	return `
+		SELECT TOP (1) session_id, end_time, tran_count
+		FROM sys.dm_cdc_log_scan_sessions
+		WHERE scan_phase = 'Done'
+		ORDER BY session_id DESC
+	`
+}
+
+// MSSQLCDCCaptureJobConfigQuery returns maxtrans and pollinginterval settings for the CDC capture job.
+func MSSQLCDCCaptureJobConfigQuery() string {
+	return "SELECT maxtrans, pollinginterval FROM msdb.dbo.cdc_jobs WHERE database_id = DB_ID()"
+}
+
 // MSSQLCDCGetChangesQuery returns the query to fetch CDC changes for a capture instance
 func MSSQLCDCGetChangesQuery(captureInstance string) string {
 	return fmt.Sprintf(`
 		SELECT *
 		FROM cdc.[fn_cdc_get_all_changes_%s](@p1, @p2, 'all')
+		ORDER BY [__$start_lsn], [__$seqval]
 	`, captureInstance)
 }
 
@@ -1054,33 +997,80 @@ func OracleTableDetailsQuery(schemaName, tableName string) string {
 	return fmt.Sprintf("SELECT column_name, data_type, nullable, data_precision, data_scale FROM all_tab_columns WHERE owner = '%s' AND table_name = '%s'", schemaName, tableName)
 }
 
+// OracleColumnDataTypeQuery returns the query to fetch the data type of a column in OracleDB
+func OracleColumnDataTypeQuery(schemaName, tableName, columnName string) string {
+	return fmt.Sprintf("SELECT DATA_TYPE FROM ALL_TAB_COLUMNS WHERE OWNER = '%s' AND TABLE_NAME = '%s' AND COLUMN_NAME = '%s'", schemaName, tableName, columnName)
+}
+
 // OraclePrimaryKeyQuery returns the query to fetch all the primary key columns of a table in OracleDB
 func OraclePrimaryKeyColummsQuery(schemaName, tableName string) string {
 	return fmt.Sprintf(`SELECT cols.column_name FROM all_constraints cons, all_cons_columns cols WHERE cons.constraint_type = 'P' AND cons.constraint_name = cols.constraint_name AND cons.owner = cols.owner AND cons.owner = '%s' AND cols.table_name = '%s'`, schemaName, tableName)
 }
 
-// OracleChunkScanQuery returns the query to fetch the rows of a table in OracleDB
-func OracleChunkScanQuery(stream types.StreamInterface, chunk types.Chunk, filter string) string {
-	chunkMin := chunk.Min.(string)
+// OracleChunkScanQuery returns the query to fetch the rows of a table in OracleDB.
+// Both chunk.Min and chunk.Max nil is invalid and returns an error.
+func OracleChunkScanQuery(stream types.StreamInterface, chunk types.Chunk, filter string) (string, error) {
 	quotedTable := QuoteTable(stream.Namespace(), stream.Name(), constants.Oracle)
-
 	filterClause := utils.Ternary(filter == "", "", " AND ("+filter+")").(string)
 
-	if chunk.Max != nil {
-		chunkMax := chunk.Max.(string)
-		return fmt.Sprintf("SELECT * FROM %s WHERE ROWID >= '%v' AND ROWID < '%v' %s",
-			quotedTable, chunkMin, chunkMax, filterClause)
+	var rowidCond string
+	switch {
+	case chunk.Min == nil && chunk.Max == nil:
+		return "", fmt.Errorf("invalid chunk for table %s: both min and max are nil", stream.Name())
+	case chunk.Min == nil && chunk.Max != nil:
+		rowidCond = fmt.Sprintf("ROWID < '%v'", chunk.Max.(string))
+	case chunk.Min != nil && chunk.Max == nil:
+		rowidCond = fmt.Sprintf("ROWID >= '%v'", chunk.Min.(string))
+	default:
+		rowidCond = fmt.Sprintf("ROWID >= '%v' AND ROWID < '%v'", chunk.Min.(string), chunk.Max.(string))
 	}
-	return fmt.Sprintf("SELECT * FROM %s WHERE ROWID >= '%v' %s",
-		quotedTable, chunkMin, filterClause)
+
+	return fmt.Sprintf("SELECT * FROM %s WHERE %s %s", quotedTable, rowidCond, filterClause), nil
+}
+
+/* Oracle Extents Based Chunking Strategy Related Queries
+// OracleExtentsQuery returns the query to fetch the extents of a table in OracleDB
+func OracleExtentsQuery() string {
+	return `SELECT
+	e.RELATIVE_FNO,
+	e.BLOCK_ID,
+	e.BLOCKS,
+	o.DATA_OBJECT_ID
+  FROM DBA_EXTENTS e
+  JOIN ALL_OBJECTS o
+	ON e.OWNER = o.OWNER
+   AND e.SEGMENT_NAME = o.OBJECT_NAME
+   AND NVL(e.PARTITION_NAME, 'NONE') = NVL(o.SUBOBJECT_NAME, 'NONE')
+  WHERE e.OWNER = :1
+	AND e.SEGMENT_NAME = :2
+	AND e.SEGMENT_TYPE IN ('TABLE', 'TABLE PARTITION', 'TABLE SUBPARTITION')
+	AND o.DATA_OBJECT_ID IS NOT NULL
+  ORDER BY o.DATA_OBJECT_ID, e.RELATIVE_FNO, e.BLOCK_ID;`
+}
+
+// OracleRowIDCreateQuery returns the query to create a row id in OracleDB based on the params: data object id, file id and block id
+func OracleRowIDCreateQuery() string {
+	return `SELECT DBMS_ROWID.ROWID_CREATE(1, :1, :2, :3, 0) FROM DUAL`
+}
+*/
+
+// OracleMinMaxRowIDQuery returns the query to fetch the min and max row id of a table in OracleDB
+func OracleMinMaxRowIDQuery(stream types.StreamInterface) string {
+	return fmt.Sprintf(`SELECT MIN(ROWID) AS minRowId, MAX(ROWID) AS maxRowId FROM %q.%q`, stream.Namespace(), stream.Name())
+}
+
+// NextRowIDQuery returns the query to fetch the next max row id
+func NextRowIDQuery(stream types.StreamInterface, ROWID string, chunkSize int64) string {
+	return fmt.Sprintf("SELECT MAX(ROWID),COUNT(*) AS row_count FROM(SELECT ROWID FROM %q.%q WHERE ROWID >= '%s' ORDER BY ROWID FETCH FIRST %d ROWS ONLY)", stream.Namespace(), stream.Name(), ROWID, chunkSize)
 }
 
 // OracleTableRowStatsQuery returns the query to fetch the estimated row count of a table in Oracle
 func OracleTableRowStatsQuery() string {
-	return `SELECT NUM_ROWS FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME = :2`
+	// NVL(AVG_ROW_LEN, 2048) is used to handle the case where the average row length is not available due to outdated stats we are assuming 2kb
+	return `SELECT NUM_ROWS, NVL(AVG_ROW_LEN, 300) AS avg_row_len FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME = :2`
 }
 
-// OracleTableSizeQuery returns the query to fetch the size of a table in bytes in OracleDB
+// OracleBlockSizeQuery returns the query to fetch the size of a block in bytes in OracleDB
 func OracleBlockSizeQuery() string {
 	return `SELECT CEIL(BYTES / NULLIF(BLOCKS, 0)) FROM user_segments WHERE BLOCKS IS NOT NULL AND ROWNUM =1`
 }
@@ -1147,7 +1137,7 @@ func IncrementalValueFormatter(ctx context.Context, cursorField, argumentPlaceho
 	var dbDatatype string
 	switch opts.Driver {
 	case constants.Oracle:
-		query := fmt.Sprintf("SELECT DATA_TYPE FROM ALL_TAB_COLUMNS WHERE OWNER = '%s' AND TABLE_NAME = '%s' AND COLUMN_NAME = '%s'", stream.Namespace(), stream.Name(), cursorField)
+		query := OracleColumnDataTypeQuery(stream.Namespace(), stream.Name(), cursorField)
 		err = opts.Client.QueryRowContext(ctx, query).Scan(&dbDatatype)
 		if err != nil {
 			return "", nil, fmt.Errorf("failed to get column datatype: %s", err)
@@ -1178,72 +1168,141 @@ func IncrementalValueFormatter(ctx context.Context, cursorField, argumentPlaceho
 
 // ParseFilter converts a filter string to a valid SQL WHERE condition, also appends the threshold filter if present
 func SQLFilter(stream types.StreamInterface, driver string, thresholdFilter string) (string, error) {
-	buildCondition := func(cond types.Condition, driver string) (string, error) {
-		var driverType constants.DriverType
-		switch driver {
-		case "mysql":
-			driverType = constants.MySQL
-		case "postgres":
-			driverType = constants.Postgres
-		case "oracle":
-			driverType = constants.Oracle
-		case "mssql":
-			driverType = constants.MSSQL
-		case "db2":
-			driverType = constants.DB2
-		default:
-			driverType = constants.Postgres // default fallback
-		}
+	// Resolve driver type once.
+	var driverType constants.DriverType
+	switch strings.ToLower(driver) {
+	case "mysql":
+		driverType = constants.MySQL
+	case "postgres":
+		driverType = constants.Postgres
+	case "oracle":
+		driverType = constants.Oracle
+	case "mssql":
+		driverType = constants.MSSQL
+	case "db2":
+		driverType = constants.DB2
+	default:
+		driverType = constants.Postgres
+	}
 
+	filter, isLegacy, err := stream.GetFilter()
+	if err != nil {
+		return "", fmt.Errorf("failed to parse stream filter: %s", err)
+	}
+
+	formatFilterBoolValue := func(driverType constants.DriverType, value bool) string {
+		if driverType == constants.MSSQL {
+			return utils.Ternary(value, "1", "0").(string)
+		}
+		return utils.Ternary(value, "TRUE", "FALSE").(string)
+	}
+
+	// buildCondition builds the SQL condition for a single filter condition.
+	buildCondition := func(cond types.FilterCondition) (string, error) {
 		quotedColumn := QuoteIdentifier(cond.Column, driverType)
 
-		// Handle unquoted null value
-		if cond.Value == "null" {
+		// ---------- NULL handling ----------
+		isNullKeyword := false
+		if isLegacy {
+			if s, ok := cond.Value.(string); ok && strings.EqualFold(strings.TrimSpace(s), "null") {
+				isNullKeyword = true
+			}
+		}
+
+		if cond.Value == nil || isNullKeyword {
 			switch cond.Operator {
 			case "=":
 				return fmt.Sprintf("%s IS NULL", quotedColumn), nil
 			case "!=":
 				return fmt.Sprintf("%s IS NOT NULL", quotedColumn), nil
 			default:
-				return fmt.Sprintf("%s %s NULL", quotedColumn, cond.Operator), nil
+				return "", fmt.Errorf("operator %s not supported with NULL", cond.Operator)
 			}
 		}
 
-		// Parse and format value
-		value := cond.Value
-		if strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"") {
-			// Handle quoted strings
-			unquoted := value[1 : len(value)-1]
-			escaped := strings.ReplaceAll(unquoted, "'", "''")
-			value = fmt.Sprintf("'%s'", escaped)
-		} else {
-			_, err := strconv.ParseFloat(value, 64)
-			booleanValue := strings.EqualFold(value, "true") || strings.EqualFold(value, "false")
-			if err != nil && !booleanValue {
-				escaped := strings.ReplaceAll(value, "'", "''")
+		// ---------- value formatting ----------
+		var valueSQL string
+
+		if isLegacy {
+			// Legacy filters: value always comes in as a string token from the
+			// original filter expression (e.g. 10, "foo", true, null).
+			value, ok := cond.Value.(string)
+			if !ok {
+				value = fmt.Sprint(cond.Value)
+			}
+
+			if strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"") {
+				// Handle quoted strings
+				unquoted := value[1 : len(value)-1]
+				escaped := strings.ReplaceAll(unquoted, "'", "''")
 				value = fmt.Sprintf("'%s'", escaped)
+			} else {
+				_, err := strconv.ParseFloat(value, 64)
+				booleanValue := strings.EqualFold(value, "true") || strings.EqualFold(value, "false")
+				if err != nil && !booleanValue {
+					escaped := strings.ReplaceAll(value, "'", "''")
+					value = fmt.Sprintf("'%s'", escaped)
+				} else if booleanValue {
+					value = formatFilterBoolValue(driverType, strings.EqualFold(value, "true"))
+				}
 			}
+
+			return fmt.Sprintf("%s %s %s", quotedColumn, cond.Operator, value), nil
 		}
 
-		return fmt.Sprintf("%s %s %s", quotedColumn, cond.Operator, value), nil
+		// New JSON filter path: use the real Go type coming from JSON decoding.
+		switch v := cond.Value.(type) {
+		case string:
+			// TODO: Audit Unicode handling of string filters with special characters (Ω, ⚡, emoji, etc.) for all JDBC drivers (MSSQL, Postgres, MySQL, Oracle, DB2).
+			// default: treat as escaped string
+			escaped := strings.ReplaceAll(v, "'", "''")
+			valueSQL = fmt.Sprintf("'%s'", escaped)
+			// Driver-specific timestamp handling for ISO 8601 / RFC3339 strings.
+			isISO8601 := strings.Contains(v, "T") && (strings.Contains(v, "Z") || strings.Contains(v, "+") || (strings.Contains(v, "-") && len(v) > 19))
+			if isISO8601 {
+				if t, err := time.Parse(time.RFC3339, v); err == nil {
+					switch driverType {
+					case constants.Oracle:
+						valueSQL = fmt.Sprintf("TO_TIMESTAMP('%s', 'YYYY-MM-DD HH24:MI:SS.FF')", t.UTC().Format("2006-01-02 15:04:05.000"))
+					case constants.DB2:
+						// DB2 TIMESTAMP() scalar accepts 'YYYY-MM-DD HH:MM:SS.ffffff'
+						valueSQL = fmt.Sprintf("TIMESTAMP('%s')", t.UTC().Format("2006-01-02 15:04:05.000000"))
+					}
+				}
+			}
+
+		case bool:
+			valueSQL = formatFilterBoolValue(driverType, v)
+		case int:
+			valueSQL = strconv.Itoa(v)
+		case int64:
+			valueSQL = strconv.FormatInt(v, 10)
+		case float64:
+			valueSQL = strconv.FormatFloat(v, 'f', -1, 64)
+		default:
+			// last-resort safety
+			escaped := strings.ReplaceAll(fmt.Sprint(v), "'", "''")
+			valueSQL = fmt.Sprintf("'%s'", escaped)
+		}
+
+		return fmt.Sprintf("%s %s %s", quotedColumn, cond.Operator, valueSQL), nil
 	}
 
-	filter, err := stream.GetFilter()
-	if err != nil {
-		return "", fmt.Errorf("failed to parse stream filter: %s", err)
-	}
-
+	// ---------- build SQL ----------
 	var finalFilter string
 	var filterErr error
-	switch {
-	case len(filter.Conditions) == 0:
+	switch len(filter.Conditions) {
+	case 0:
 		return thresholdFilter, nil
-	case len(filter.Conditions) == 1:
-		finalFilter, filterErr = buildCondition(filter.Conditions[0], driver)
+	case 1:
+		finalFilter, err = buildCondition(filter.Conditions[0])
+		if err != nil {
+			return "", err
+		}
 	default:
 		conditions := make([]string, 0, len(filter.Conditions))
-		err := utils.ForEach(filter.Conditions, func(cond types.Condition) error {
-			formatted, err := buildCondition(cond, driver)
+		err := utils.ForEach(filter.Conditions, func(cond types.FilterCondition) error {
+			formatted, err := buildCondition(cond)
 			if err != nil {
 				return err
 			}

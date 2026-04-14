@@ -120,6 +120,18 @@ func ReformatValue(dataType types.DataType, v any) (any, error) {
 	}
 }
 
+// ParseFilterValue parses v into dataType strictly and returns the typed value.
+// For timestamp types, an unparseable string always returns an error
+// ReformatValue which silently falls back to epoch when isTimestampInDB=true).
+func ParseFilterValue(dataType types.DataType, v any) (any, error) {
+	switch dataType {
+	case types.Timestamp, types.TimestampMilli, types.TimestampMicro, types.TimestampNano:
+		return ReformatDate(v, false)
+	default:
+		return ReformatValue(dataType, v)
+	}
+}
+
 func ReformatBool(v interface{}) (bool, error) {
 	switch booleanValue := v.(type) {
 	case bool:
@@ -253,7 +265,6 @@ func parseStringTimestamp(value string, isTimestampInDB bool) (time.Time, error)
 				}
 			}
 		}
-
 		return true
 	}
 
@@ -276,7 +287,7 @@ func parseStringTimestamp(value string, isTimestampInDB bool) (time.Time, error)
 	if !isTimestampInDB && constants.LoadedStateVersion != 0 {
 		return time.Time{}, fmt.Errorf("failed to parse datetime from available formats: %s", err)
 	}
-
+	logger.Debugf("Failed to parse datetime from available formats: %s", err)
 	return time.Unix(0, 0).UTC(), nil
 }
 
@@ -325,7 +336,7 @@ func ReformatInt64(v any) (int64, error) {
 	case *any:
 		return ReformatInt64(*v)
 	case []uint8:
-		if constants.LoadedStateVersion > 4 {
+		if constants.LoadedStateVersion > 5 {
 			strVal := string(v)
 			intValue, err := strconv.ParseInt(strVal, 10, 64)
 			if err == nil {

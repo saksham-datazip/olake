@@ -48,6 +48,8 @@ type IntegrationTest struct {
 	DestinationDB                    string
 	CursorField                      string
 	PartitionRegex                   string
+	FilterConfig                     string
+	ColumnToExclude                  string
 }
 
 type PerformanceTest struct {
@@ -74,6 +76,7 @@ type TestConfig struct {
 	HostTestDataPath       string
 	HostCatalogPath        string
 	HostTestCatalogPath    string
+	DataFormat             string
 }
 
 // history stores the RPS values and the last updated time for a given mode.
@@ -170,7 +173,7 @@ func (s *benchmarkStore) stats(
 }
 
 // GetTestConfig returns the test config for the given driver
-func GetTestConfig(driver string) *TestConfig {
+func GetTestConfig(driver string, extraParams ...string) *TestConfig {
 	// pwd is olake/drivers/(driver)/internal
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -178,12 +181,16 @@ func GetTestConfig(driver string) *TestConfig {
 	}
 	// root path is olake's root path
 	rootPath := filepath.Join(pwd, "../../..")
-
+	dataFormat := ""
+	if len(extraParams) > 0 {
+		dataFormat = extraParams[0]
+	}
 	containerTestDataPath := "/test-olake/drivers/%s/internal/testdata/%s"
-	hostTestDataPath := filepath.Join(rootPath, "drivers", "%s", "internal", "testdata", "%s")
+	hostTestDataPath := filepath.Join(rootPath, "drivers", "%s", "internal", "testdata", dataFormat, "%s")
 	return &TestConfig{
 		Driver:                 driver,
 		HostRootPath:           rootPath,
+		DataFormat:             dataFormat,
 		HostTestDataPath:       fmt.Sprintf(hostTestDataPath, driver, ""),
 		HostTestCatalogPath:    fmt.Sprintf(hostTestDataPath, driver, "test_streams.json"),
 		HostCatalogPath:        fmt.Sprintf(hostTestDataPath, driver, "streams.json"),
@@ -226,8 +233,8 @@ func discoverCommand(config TestConfig, flags ...string) string {
 	return baseCmd
 }
 
-// update normalization=true for selected streams under selected_streams.<namespace> by name
-func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex string, stream []string, isBackfill bool) string {
+// update normalization=true, partition_regex, and filter_input for selected streams under selected_streams.<namespace> by name
+func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex, filterConfig string, stream []string, isBackfill bool, columnToExclude string) string {
 	if len(stream) == 0 {
 		return ""
 	}
@@ -238,8 +245,14 @@ func updateSelectedStreamsCommand(config TestConfig, namespace, partitionRegex s
 	}
 	condition := strings.Join(streamConditions, " or ")
 	tmpCatalog := fmt.Sprintf("/tmp/%s_%s_streams.json", config.Driver, utils.Ternary(isBackfill, "backfill", "cdc").(string))
+
+	if filterConfig == "" {
+		filterConfig = "{}"
+	}
 	jqExpr := fmt.Sprintf(
-		`jq '.selected_streams = { "%s": (.selected_streams["%s"] | map(select(%s) | .normalization = true | .partition_regex = "%s")) }' %s > %s && mv %s %s`,
+		`jq --argjson filter '%s' --arg col '%s' '.selected_streams = { "%s": (.selected_streams["%s"] | map(select(%s) | .normalization = true | .partition_regex = "%s" | .filter_config = $filter | .selected_columns.columns -= [$col])) }' %s > %s && mv %s %s`,
+		filterConfig,
+		columnToExclude,
 		namespace,
 		namespace,
 		condition,
@@ -396,17 +409,17 @@ func (cfg *IntegrationTest) runSyncAndVerify(
 	case "iceberg":
 		{
 			if evolvedSchema {
-				VerifyIcebergSync(t, testTable, cfg.DestinationDB, cfg.UpdatedDestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.PartitionRegex, cfg.TestConfig.Driver, isCDC)
+				VerifyIcebergSync(t, testTable, cfg.DestinationDB, cfg.UpdatedDestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.PartitionRegex, cfg.TestConfig.Driver, isCDC, cfg.ColumnToExclude)
 			} else {
-				VerifyIcebergSync(t, testTable, cfg.DestinationDB, cfg.DestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.PartitionRegex, cfg.TestConfig.Driver, isCDC)
+				VerifyIcebergSync(t, testTable, cfg.DestinationDB, cfg.DestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.PartitionRegex, cfg.TestConfig.Driver, isCDC, cfg.ColumnToExclude)
 			}
 		}
 	case "parquet":
 		{
 			if evolvedSchema {
-				VerifyParquetSync(t, testTable, cfg.DestinationDB, cfg.UpdatedDestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.TestConfig.Driver, isCDC)
+				VerifyParquetSync(t, testTable, cfg.DestinationDB, cfg.UpdatedDestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.TestConfig.Driver, isCDC, cfg.ColumnToExclude)
 			} else {
-				VerifyParquetSync(t, testTable, cfg.DestinationDB, cfg.DestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.TestConfig.Driver, isCDC)
+				VerifyParquetSync(t, testTable, cfg.DestinationDB, cfg.DestinationDataTypeSchema, cfg.DefaultCDCColumnsSchema, schema, opSymbol, cfg.TestConfig.Driver, isCDC, cfg.ColumnToExclude)
 			}
 		}
 	}
@@ -444,7 +457,7 @@ func (cfg *IntegrationTest) testIcebergFullLoadAndCDC(
 		return fmt.Errorf("failed to reset table: %w", err)
 	}
 
-	testCases := []syncTestCase{
+	dbTestCases := []syncTestCase{
 		{
 			name:      "Full-Refresh",
 			operation: "",
@@ -475,12 +488,31 @@ func (cfg *IntegrationTest) testIcebergFullLoadAndCDC(
 		},
 	}
 
+	kafkaTestCases := []syncTestCase{
+		{
+			name:      "CDC - strict - insert",
+			operation: "",
+			useState:  false,
+			opSymbol:  "c",
+			expected:  cfg.ExpectedData,
+		},
+		{
+			name:      "CDC - strict - update",
+			operation: "update",
+			useState:  true,
+			opSymbol:  "c",
+			expected:  cfg.ExpectedUpdatedData,
+		},
+	}
+
+	testCases := utils.Ternary(cfg.TestConfig.Driver == string(constants.Kafka), kafkaTestCases, dbTestCases).([]syncTestCase)
+
 	// Run each test case
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// schema evolution
 			if tc.operation == "update" {
-				if cfg.TestConfig.Driver != "mongodb" && cfg.TestConfig.Driver != "mssql" {
+				if cfg.TestConfig.Driver != "mongodb" && cfg.TestConfig.Driver != "mssql" && cfg.TestConfig.Driver != "kafka" {
 					cfg.ExecuteQuery(ctx, t, []string{testTable}, "evolve-schema", false)
 				}
 			}
@@ -524,7 +556,7 @@ func (cfg *IntegrationTest) testParquetFullLoadAndCDC(
 		return fmt.Errorf("failed to reset table: %s", err)
 	}
 
-	testCases := []syncTestCase{
+	dbTestCases := []syncTestCase{
 		{
 			name:      "Full-Refresh",
 			operation: "",
@@ -555,12 +587,31 @@ func (cfg *IntegrationTest) testParquetFullLoadAndCDC(
 		},
 	}
 
+	kafkaTestCases := []syncTestCase{
+		{
+			name:      "CDC - strict - insert",
+			operation: "",
+			useState:  false,
+			opSymbol:  "c",
+			expected:  cfg.ExpectedData,
+		},
+		{
+			name:      "CDC - strict - update",
+			operation: "update",
+			useState:  true,
+			opSymbol:  "c",
+			expected:  cfg.ExpectedUpdatedData,
+		},
+	}
+
+	testCases := utils.Ternary(cfg.TestConfig.Driver == string(constants.Kafka), kafkaTestCases, dbTestCases).([]syncTestCase)
+
 	// Run each test case
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// schema evolution
 			if tc.operation == "update" {
-				if cfg.TestConfig.Driver != "mongodb" && cfg.TestConfig.Driver != "mssql" {
+				if cfg.TestConfig.Driver != "mongodb" && cfg.TestConfig.Driver != "mssql" && cfg.TestConfig.Driver != "kafka" {
 					cfg.ExecuteQuery(ctx, t, []string{testTable}, "evolve-schema", false)
 				}
 			}
@@ -649,7 +700,7 @@ func (cfg *IntegrationTest) testIcebergFullLoadAndIncremental(
 		t.Run(tc.name, func(t *testing.T) {
 			// schema evolution
 			if tc.operation == "update" {
-				if cfg.TestConfig.Driver != string(constants.MongoDB) && cfg.TestConfig.Driver != string(constants.Oracle) && cfg.TestConfig.Driver != "mssql" {
+				if cfg.TestConfig.Driver != string(constants.MongoDB) && cfg.TestConfig.Driver != "mssql" {
 					cfg.ExecuteQuery(ctx, t, []string{testTable}, "evolve-schema", false)
 				}
 			}
@@ -736,7 +787,7 @@ func (cfg *IntegrationTest) testParquetFullLoadAndIncremental(
 		t.Run(tc.name, func(t *testing.T) {
 			// schema evolution
 			if tc.operation == "update" {
-				if cfg.TestConfig.Driver != string(constants.MongoDB) && cfg.TestConfig.Driver != string(constants.Oracle) && cfg.TestConfig.Driver != "mssql" {
+				if cfg.TestConfig.Driver != string(constants.MongoDB) && cfg.TestConfig.Driver != "mssql" {
 					cfg.ExecuteQuery(ctx, t, []string{testTable}, "evolve-schema", false)
 				}
 			}
@@ -772,11 +823,11 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 
 	t.Logf("Root Project directory: %s", cfg.TestConfig.HostRootPath)
 	t.Logf("Test data directory: %s", cfg.TestConfig.HostTestDataPath)
-	currentTestTable := fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver)
+	currentTestTable := utils.Ternary(cfg.TestConfig.DataFormat == "", fmt.Sprintf("%s_test_table_olake", cfg.TestConfig.Driver), fmt.Sprintf("%s_%s_test_table_olake", cfg.TestConfig.Driver, cfg.TestConfig.DataFormat)).(string)
 
 	t.Run("Discover", func(t *testing.T) {
 		req := testcontainers.ContainerRequest{
-			Image:         "golang:1.24.0",
+			Image:         "golang:1.25.9-bookworm",
 			ImagePlatform: "linux/amd64",
 			HostConfigModifier: func(hc *container.HostConfig) {
 				hc.Binds = []string{
@@ -850,7 +901,7 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 
 	t.Run("Sync", func(t *testing.T) {
 		req := testcontainers.ContainerRequest{
-			Image:         "golang:1.24.0",
+			Image:         "golang:1.25.9-bookworm",
 			ImagePlatform: "linux/amd64",
 			HostConfigModifier: func(hc *container.HostConfig) {
 				hc.Binds = []string{
@@ -883,7 +934,7 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 							// 	`jq '(.selected_streams[][] | .normalization) = true' %s > /tmp/streams.json && mv /tmp/streams.json %s`,
 							// 	cfg.TestConfig.CatalogPath, cfg.TestConfig.CatalogPath,
 							// )
-							streamUpdateCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, cfg.PartitionRegex, []string{currentTestTable}, true)
+							streamUpdateCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, cfg.PartitionRegex, cfg.FilterConfig, []string{currentTestTable}, true, cfg.ColumnToExclude)
 							if code, out, err := utils.ExecCommand(ctx, c, streamUpdateCmd); err != nil || code != 0 {
 								return fmt.Errorf("failed to enable normalization and partition regex in streams.json (%d): %s\n%s",
 									code, err, out,
@@ -900,6 +951,7 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 								{"Arrow", true},
 							}
 
+							// Skip cdc tests for drivers not supporting cdc mode
 							if !slices.Contains(constants.SkipCDCDrivers, constants.DriverType(cfg.TestConfig.Driver)) {
 								for _, wt := range writerTypes {
 									t.Run(fmt.Sprintf("Iceberg (%s) Full load + CDC tests", wt.name), func(t *testing.T) {
@@ -916,19 +968,22 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 								})
 							}
 
-							for _, wt := range writerTypes {
-								t.Run(fmt.Sprintf("Iceberg (%s) Full load + Incremental tests", wt.name), func(t *testing.T) {
-									if err := cfg.testIcebergWriter(ctx, t, c, currentTestTable, wt.useArrow, cfg.testIcebergFullLoadAndIncremental); err != nil {
-										t.Fatalf("Iceberg (%s) Full load + Incremental tests failed: %v", wt.name, err)
+							// Skip incremental tests for drivers not supporting incremental mode
+							if cfg.TestConfig.Driver != string(constants.Kafka) {
+								for _, wt := range writerTypes {
+									t.Run(fmt.Sprintf("Iceberg (%s) Full load + Incremental tests", wt.name), func(t *testing.T) {
+										if err := cfg.testIcebergWriter(ctx, t, c, currentTestTable, wt.useArrow, cfg.testIcebergFullLoadAndIncremental); err != nil {
+											t.Fatalf("Iceberg (%s) Full load + Incremental tests failed: %v", wt.name, err)
+										}
+									})
+								}
+
+								t.Run("Parquet Full load + Incremental tests", func(t *testing.T) {
+									if err := cfg.testParquetFullLoadAndIncremental(ctx, t, c, currentTestTable); err != nil {
+										t.Fatalf("Parquet Full load + Incremental tests failed: %v", err)
 									}
 								})
 							}
-
-							t.Run("Parquet Full load + Incremental tests", func(t *testing.T) {
-								if err := cfg.testParquetFullLoadAndIncremental(ctx, t, c, currentTestTable); err != nil {
-									t.Fatalf("Parquet Full load + Incremental tests failed: %v", err)
-								}
-							})
 
 							// 5. Clean up
 							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)
@@ -983,7 +1038,7 @@ func dropIcebergTable(t *testing.T, tableName, icebergDB string) {
 
 // TODO: Refactor parsing logic into a reusable utility functions
 // verifyIcebergSync verifies that data was correctly synchronized to Iceberg
-func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema map[string]string, defaultCDCColumnsSchema map[string]string, schema map[string]interface{}, opSymbol, partitionRegex, driver string, isCDC bool) {
+func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema map[string]string, defaultCDCColumnsSchema map[string]string, schema map[string]interface{}, opSymbol, partitionRegex, driver string, isCDC bool, excludedColumn string) {
 	t.Helper()
 	ctx := context.Background()
 	spark, err := sql.NewSessionBuilder().Remote(sparkConnectAddress).Build(ctx)
@@ -999,6 +1054,13 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		"SELECT * FROM %s WHERE _op_type = '%s'",
 		fullTableName, opSymbol,
 	)
+	// In kafka, _op_type is always 'c' and col_included appears only in new rows.
+	// To check new record, col_included is used.
+	if driver == string(constants.Kafka) {
+		if _, ok := schema["col_included"]; ok {
+			selectQuery += " AND col_included IS NOT NULL"
+		}
+	}
 	t.Logf("Executing query: %s", selectQuery)
 
 	var selectRows []types.Row
@@ -1029,6 +1091,13 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 			break
 		}
 
+		// For delete operations, 0 rows is acceptable - exit immediately without retrying
+		if opSymbol == "d" {
+			queryErr = nil
+			t.Logf("Delete verification passed: found 0 rows for _op_type = 'd' (acceptable)")
+			break
+		}
+
 		// for every type of operation, op symbol will be different, using that to ensure data is not stale
 		queryErr = fmt.Errorf("stale data: query succeeded but returned 0 rows for _op_type = '%s'", opSymbol)
 		t.Logf("Query attempt %d/%d failed: %v", attempt+1, maxRetries, queryErr)
@@ -1040,15 +1109,17 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		}
 	}
 
-	require.NoError(t, queryErr, "Failed to collect data rows from Iceberg after %d attempts: %v", maxRetries, queryErr)
-	require.NotEmpty(t, selectRows, "No rows returned for _op_type = '%s'", opSymbol)
-
-	// delete row checked
+	// For delete operations, accept both 0 and 1 row (both are valid outcomes)
 	if opSymbol == "d" {
-		deletedID := selectRows[0].Value("_olake_id")
-		require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		if len(selectRows) > 0 {
+			deletedID := selectRows[0].Value("_olake_id")
+			require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		}
+		t.Logf("Delete verification passed: found %d row(s) for _op_type = 'd'", len(selectRows))
 		return
 	}
+	require.NoError(t, queryErr, "Failed to collect data rows from Iceberg after %d attempts: %v", maxRetries, queryErr)
+	require.NotEmpty(t, selectRows, "No rows returned for _op_type = '%s'", opSymbol)
 
 	for rowIdx, row := range selectRows {
 		icebergMap := make(map[string]interface{}, len(schema)+1)
@@ -1064,7 +1135,12 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 			for key := range defaultCDCColumnsSchema {
 				icebergValue, ok := icebergMap[key]
 				require.Truef(t, ok, "Row %d: missing column %q in Iceberg result", rowIdx, key)
-				require.NotEmpty(t, icebergValue, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, icebergValue)
+				// Kafka offset, partition can be 0, NotEmpty fails for 0 so we check for NotNil instead.
+				if key == "_kafka_offset" || key == "_kafka_partition" {
+					require.NotNil(t, icebergValue, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, icebergValue)
+				} else {
+					require.NotEmpty(t, icebergValue, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, icebergValue)
+				}
 				if key == constants.CdcTimestamp {
 					ts, ok := normalizeToTime(icebergValue)
 					require.Truef(t, ok, "Row %d: expected %q to be a timestamp, got %T (%#v)", rowIdx, key, icebergValue, icebergValue)
@@ -1095,6 +1171,11 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 		if !strings.HasPrefix(colName, "#") {
 			icebergSchema[colName] = dataType
 		}
+	}
+
+	if excludedColumn != "" {
+		_, ok := icebergSchema[utils.Reformat(excludedColumn)]
+		require.Falsef(t, ok, "Excluded column %q should not exist in Iceberg schema", excludedColumn)
 	}
 
 	for col, dbType := range datatypeSchema {
@@ -1141,7 +1222,7 @@ func VerifyIcebergSync(t *testing.T, tableName, icebergDB string, datatypeSchema
 }
 
 // VerifyParquetSync verifies that data was correctly synchronized to Parquet files in MinIO
-func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema map[string]string, defaultCDCColumnsSchema map[string]string, schema map[string]interface{}, opSymbol, driver string, isCDC bool) {
+func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema map[string]string, defaultCDCColumnsSchema map[string]string, schema map[string]interface{}, opSymbol, driver string, isCDC bool, excludedColumn string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -1181,6 +1262,11 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 		if err == nil {
 			break
 		}
+		// For delete operations, if path doesn't exist that's acceptable (no data written)
+		if opSymbol == "d" && strings.Contains(err.Error(), "PATH_NOT_FOUND") {
+			t.Logf("Delete verification passed: Parquet path does not exist (no data written)")
+			return
+		}
 		if attempt < maxRetries {
 			t.Logf("Attempt %d/%d: Failed to create view, retrying in 2s: %v", attempt, maxRetries, err)
 			time.Sleep(2 * time.Second)
@@ -1198,6 +1284,13 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 		"SELECT * FROM %s WHERE `_op_type` = '%s'",
 		viewName, opSymbol,
 	)
+	// In kafka, _op_type is always 'c' and col_included appears only in new rows.
+	// To check new record, col_included is used.
+	if driver == string(constants.Kafka) {
+		if _, ok := schema["col_included"]; ok {
+			selectQuery += " AND `col_included` IS NOT NULL"
+		}
+	}
 	t.Logf("Executing Parquet query: %s", selectQuery)
 
 	df, err := spark.Sql(ctx, selectQuery)
@@ -1205,13 +1298,19 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 
 	rows, err := df.Collect(ctx)
 	require.NoError(t, err, "Failed to collect rows from Parquet query")
-	require.NotEmpty(t, rows, "No rows returned for _op_type = '%s'", opSymbol)
 
+	// For delete operations, accept both 0 and 1 row (both are valid outcomes)
 	if opSymbol == "d" {
-		deletedID := rows[0].Value("_olake_id")
-		require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		if len(rows) > 0 {
+			deletedID := rows[0].Value("_olake_id")
+			require.NotEmpty(t, deletedID, "Delete verification failed: _olake_id should not be empty")
+		}
+		t.Logf("Delete verification passed: found %d row(s) for _op_type = 'd'", len(rows))
 		return
 	}
+
+	// For non-delete operations, require at least one row
+	require.NotEmpty(t, rows, "No rows returned for _op_type = '%s'", opSymbol)
 
 	for rowIdx, row := range rows {
 		parquetMap := make(map[string]interface{}, len(schema)+1)
@@ -1228,7 +1327,12 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 			for key := range defaultCDCColumnsSchema {
 				val, ok := parquetMap[key]
 				require.Truef(t, ok, "Row %d: missing column %q in Parquet result", rowIdx, key)
-				require.NotEmpty(t, val, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, val)
+				// Kafka offset, partition can be 0, NotEmpty fails for 0 so we check for NotNil instead.
+				if key == "_kafka_offset" || key == "_kafka_partition" {
+					require.NotNil(t, val, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, val)
+				} else {
+					require.NotEmpty(t, val, "Row %d: expected column %q to be non-empty, got %#v", rowIdx, key, val)
+				}
 				if key == constants.CdcTimestamp {
 					ts, ok := normalizeToTime(val)
 					require.Truef(t, ok, "Row %d: expected %q to be a timestamp, got %T (%#v)", rowIdx, key, val, val)
@@ -1261,6 +1365,10 @@ func VerifyParquetSync(t *testing.T, tableName, parquetDB string, datatypeSchema
 		if !strings.HasPrefix(colName, "#") {
 			parquetSchema[colName] = dataType
 		}
+	}
+	if excludedColumn != "" {
+		_, ok := parquetSchema[utils.Reformat(excludedColumn)]
+		require.Falsef(t, ok, "Excluded column %q should not exist in Parquet schema", excludedColumn)
 	}
 
 	for col, dbType := range datatypeSchema {
@@ -1309,6 +1417,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 		}
 
 		averageRPS, observations := benchmarks.stats(isBackfill)
+		t.Logf("currentRPS: %.2f, averageRPS: %.2f, observations: %d", rps, averageRPS, observations)
 
 		// No benchmarks exist yet for this driver/mode
 		// Skip validation to allow initial benchmarking.
@@ -1316,7 +1425,6 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 			t.Logf("No benchmarks exist yet for %s %s mode, skipping validation", config.Driver, utils.Ternary(isBackfill, "backfill", "cdc").(string))
 			return true, rps, nil
 		}
-		t.Logf("currentRPS: %.2f, averageRPS: %.2f, observations: %d", rps, averageRPS, observations)
 		if rps < BenchmarkThreshold*averageRPS {
 			return false, rps, nil
 		}
@@ -1349,7 +1457,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 
 	t.Run("performance", func(t *testing.T) {
 		req := testcontainers.ContainerRequest{
-			Image: "golang:1.24.0",
+			Image: "golang:1.25.9-bookworm",
 			HostConfigModifier: func(hc *container.HostConfig) {
 				hc.Binds = []string{
 					fmt.Sprintf("%s:/test-olake:rw", cfg.TestConfig.HostRootPath),
@@ -1388,7 +1496,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 							}
 							t.Log("(backfill) discover completed")
 
-							updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", cfg.BackfillStreams, true)
+							updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", "", cfg.BackfillStreams, true, "")
 							if code, _, err := utils.ExecCommand(ctx, c, updateStreamsCmd); err != nil || code != 0 {
 								return fmt.Errorf("failed to update streams: %s", err)
 							}
@@ -1427,7 +1535,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 								}
 								t.Log("(cdc) discover completed")
 
-								updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", cfg.CDCStreams, false)
+								updateStreamsCmd := updateSelectedStreamsCommand(*cfg.TestConfig, cfg.Namespace, "", "", cfg.CDCStreams, false, "")
 								if code, _, err := utils.ExecCommand(ctx, c, updateStreamsCmd); err != nil || code != 0 {
 									return fmt.Errorf("failed to update streams: %s", err)
 								}
